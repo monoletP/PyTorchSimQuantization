@@ -901,7 +901,8 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                 input_dma_code = self.def_dma_op("MVIN", self.prologue_info["input_dram_var"], self.prologue_info["input_idx"],
                                 self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
                 weight_dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
-                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False)
+                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
+                                dtype_override=self.prologue_info.get("weight_dtype_override"))
                 if (self.prologue_info["is_input_fused"]):
                     code.splice(input_dma_code)
                     code.splice(prologue_code)
@@ -915,7 +916,8 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                                 self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
                 code.splice(dma_code)
                 dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
-                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False)
+                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
+                                dtype_override=self.prologue_info.get("weight_dtype_override"))
                 code.splice(dma_code)
             code = textwrap.indent(code.getvalue(), " "*indent_size).strip()
             return code
@@ -982,7 +984,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
 
     def def_dma_op(self, dma_type, dram_var:str, index_list:list, tile_desc:mlir_common.MLIRMultiDimTile,
                    subtile_size:list=[], async_type=None, indent_size=0, priority: int = 5, lazy_mode: bool = True,
-                   dram_stride:list=None, dram_offset=None, padding: int = 0):
+                   dram_stride:list=None, dram_offset=None, padding: int = 0, dtype_override=None):
         # Todo. Remove legacy behavior (i.e., index_list parsing)
         def generate_dma_code():
             """Internal method to generate DMA code directly."""
@@ -998,7 +1000,9 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                     numel = self.exception_nodes[dram_var]["numel"]
                 else:
                     numel = self.get_arg_info(self.named_nodes[dram_var].get_name()).get_numel()
-                mlir_dtype = mlir_common.DTYPE_TO_MLIR[node_layout.dtype]
+                
+                dtype = dtype_override if dtype_override is not None else node_layout.dtype
+                mlir_dtype = mlir_common.DTYPE_TO_MLIR[dtype]
                 dram_shape = f"memref<{numel}x{mlir_dtype}>"
 
                 if dram_stride is not None:
@@ -1068,14 +1072,17 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
         self.render_hooks[key] = (priority, generate_dma_code)
         return key
 
-    def def_sram_buffer(self, dram_name, tile_desc, id=0, indent_size=0):
+    def def_sram_buffer(self, dram_name, tile_desc, id=0, indent_size=0, dtype_override=None):
         # Prepare code block
         with self:
-            try:
-                dtype = self.named_nodes[dram_name].get_layout().dtype
-            except (KeyError, AttributeError, TypeError):
-                import torch
-                dtype = torch.float32
+            if dtype_override is not None:
+                dtype = dtype_override
+            else:
+                try:
+                    dtype = self.named_nodes[dram_name].get_layout().dtype
+                except (KeyError, AttributeError, TypeError):
+                    import torch
+                    dtype = torch.float32
             
             tile_shape = tile_desc.get_mlir_shape(mlir_common.DTYPE_TO_MLIR[dtype])
             buffer_name = self.allocate_sram_buffer(dtype, dram_name, tile_desc, id, forced_name=dram_name)

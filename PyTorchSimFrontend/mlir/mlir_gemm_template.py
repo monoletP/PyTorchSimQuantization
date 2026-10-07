@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
-from torch import empty_strided
+from torch import empty_strided, float8_e4m3fn
+from torch._inductor.virtualized import V
 from typing import List, Optional
 import sympy
 
@@ -25,6 +26,9 @@ GEMM_TEMPLATE = r"""
 func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, W, Bias], outputs=[Y], names_str="X, W, Bias, Y", input_reorder=input_reorder)}} {
   {{ kernel.def_sram_buffer("X", X_tile_desc, indent_size=2) }}
   {{ kernel.def_sram_buffer("W", W_tile_desc, indent_size=2) }}
+  {% if FP8_WEIGHT_PROLOGUE %}
+  {{ kernel.def_sram_buffer("W_fp8", W_fp8_tile_desc, indent_size=2, dtype_override=FP8_DTYPE) }}
+  {% endif %}
   {{ kernel.def_sram_buffer("Y", Y_tile_desc, indent_size=2) }}
   {% if not Bias %}
   %v0 = arith.constant dense<0.0> : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}x{{DATA_STYPE}}>{% endif %}
@@ -156,9 +160,15 @@ class MLIRGemmTemplate(MLIRTemplate):
 
         W_tile_size = [TILE_K, TILE_N]
         W_tile_stride = [1, TILE_K]
-        W_tile_desc = mlir_common.MLIRMultiDimTile(X_tile_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
+        W_tile_desc = mlir_common.MLIRMultiDimTile(W_tile_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
         W_tile_desc.set_tile_size_stride(W_tile_size, W_tile_stride)
         W_tile_desc.set_name("W_buffer")
+        
+        # fp8 weight descriptor
+        W_fp8_tile_desc = mlir_common.MLIRMultiDimTile(W_tile_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
+        W_fp8_tile_desc.set_tile_size_stride(W_tile_size, W_tile_stride)
+        W_fp8_tile_desc.set_name("W_fp8_buffer")
+        
         W_tile_desc.offset = W.get_layout().offset
         W_stride = W.get_layout().stride if N>1 else [Y.get_layout().stride[0], 0]
         W_idx = [sympy.Symbol("index2") * W_stride[0], sympy.Symbol("index1") * W_stride[1]]
@@ -191,31 +201,10 @@ class MLIRGemmTemplate(MLIRTemplate):
           Bias_idx = None
 
         data_stype = mlir_common.DTYPE_TO_MLIR[X.get_dtype()]
-
-        kernel.render_options = dict(
-            KERNEL_NAME=self.name,
-            kernel=kernel,
-            M=M, N=N, K=K,
-            TILE_M=TILE_M,
-            TILE_N=TILE_N,
-            TILE_K=TILE_K,
-            SUB_TILE_M=SUB_TILE_M,
-            SUB_TILE_N=SUB_TILE_N,
-            SUB_TILE_K=SUB_TILE_K,
-            DATA_STYPE=data_stype,
-            X = X, W = W, Y = Y,
-            Bias = Bias,
-            X_idx = X_idx,
-            W_idx = W_idx,
-            Bias_idx = Bias_idx,
-            X_tile_desc = X_tile_desc,
-            W_tile_desc = W_tile_desc,
-            Y_tile_desc = Y_tile_desc,
-            Bias_tile_desc = Bias_tile_desc,
-            epilogue_nodes = epilogue_nodes,
-            prologue_nodes = prologue_nodes,
-            input_reorder = self.input_reorder
-        )
+        
+        # Is the weight in the prologue nodes fp8?       
+        fp8_weight_prologue = False
+                            
         if prologue_nodes:
             prologue_output_name = list(prologue_nodes[0].read_writes.writes)[0].name
             if prologue_output_name == X.get_name():
@@ -232,6 +221,19 @@ class MLIRGemmTemplate(MLIRTemplate):
                 prologue_tile_desc = W_tile_desc
                 prologue_dim_aliasing = {"index0":"index2", "index1":"index1"}
                 is_input_fused = False
+            
+            # Is the weight in the prologue nodes fp8? 
+            if not is_input_fused:
+                for node in prologue_nodes:
+                    for read in node.read_writes.reads:
+                        original_input = V.graph.graph_inputs.get(read.name)
+                        if original_input is not None and original_input.get_dtype() == float8_e4m3fn:
+                            fp8_weight_prologue = True 
+            
+            # weight loading info branching for fp8 weight prologue
+            weight_load_desc = W_fp8_tile_desc if fp8_weight_prologue else W_tile_desc
+            weight_load_buffer = "W_fp8_buffer" if fp8_weight_prologue else "W_buffer"
+            weight_load_dtype = float8_e4m3fn if fp8_weight_prologue else None
 
             kernel.prologue_info = dict (
                 input_dram_var = "X",
@@ -242,11 +244,12 @@ class MLIRGemmTemplate(MLIRTemplate):
                 input_dim_aliasing = {"index0":"index0", "index1":"index2"},
 
                 weight_dram_var = "W",
-                weight_sram_var = "W_buffer",
-                weight_tile_desc = W_tile_desc,
+                weight_sram_var = weight_load_buffer,
+                weight_tile_desc = weight_load_desc,
                 weight_idx = W_idx,
                 weight_subtile_size = [TILE_K, TILE_N],
-                weight_dim_aliasing = {"index0":"index2", "index1":"index1"},
+                weight_dim_aliasing = {"index0": "index2", "index1": "index1"},
+                weight_dtype_override = weight_load_dtype,
 
                 # Descriptor for fusion
                 dram_var = prologue_var,
@@ -266,6 +269,35 @@ class MLIRGemmTemplate(MLIRTemplate):
             r_dim_size = M,
             dim_aliasing = epilogue_dim_aliasing
         )
+        
+        kernel.render_options = dict(
+            KERNEL_NAME=self.name,
+            kernel=kernel,
+            M=M, N=N, K=K,
+            TILE_M=TILE_M,
+            TILE_N=TILE_N,
+            TILE_K=TILE_K,
+            SUB_TILE_M=SUB_TILE_M,
+            SUB_TILE_N=SUB_TILE_N,
+            SUB_TILE_K=SUB_TILE_K,
+            DATA_STYPE=data_stype,
+            X = X, W = W, Y = Y,
+            Bias = Bias,
+            X_idx = X_idx,
+            W_idx = W_idx,
+            Bias_idx = Bias_idx,
+            X_tile_desc = X_tile_desc,
+            W_tile_desc = W_tile_desc,
+            W_fp8_tile_desc=W_fp8_tile_desc,
+            FP8_DTYPE=float8_e4m3fn,
+            Y_tile_desc = Y_tile_desc,
+            Bias_tile_desc = Bias_tile_desc,
+            epilogue_nodes = epilogue_nodes,
+            prologue_nodes = prologue_nodes,
+            input_reorder = self.input_reorder,
+            FP8_WEIGHT_PROLOGUE = fp8_weight_prologue
+        )
+        
         code = self._template_from_string(template).render(**kernel.render_options)
         kernel.add_loop_info([kernel.render_options["M"], kernel.render_options["N"], kernel.render_options["K"]], [kernel.render_options["TILE_M"], kernel.render_options["TILE_N"], kernel.render_options["TILE_K"]])
         return code

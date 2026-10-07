@@ -44,6 +44,7 @@ DTYPE_TO_MLIR = {
     torch.float32: "f32",
     torch.float64: "f64",
     torch.float16: "f16",
+    torch.float8_e4m3fn: "f8E4M3FN",
     torch.int64: "i64",
     torch.int32: "i32",
     torch.int16: "i16",
@@ -55,6 +56,7 @@ DTYPE_TO_MLIR = {
 }
 
 MLIR_TO_DTYPE = {
+    "f8E4M3FN": torch.float8_e4m3fn,
     "f32": torch.float32,
     "f64": torch.float64,
     "f16": torch.float16,
@@ -66,6 +68,7 @@ MLIR_TO_DTYPE = {
 }
 
 DTYPE_TO_C = {
+    torch.float8_e4m3fn: "uint8_t",
     torch.float32: "float",
     torch.float64: "double",
     torch.float16: "uint16_t",
@@ -81,6 +84,7 @@ DTYPE_TO_C = {
 MLIR_TO_BIT = {
     "i1": 1,
     "i8": 8,
+    "f8E4M3FN": 8,
     "i16": 16,
     "i32": 32,
     "i64": 64,

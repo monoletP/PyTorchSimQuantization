@@ -69,6 +69,7 @@ TORCH_TO_NUMPY = {
     torch.bool: np.uint8,
     torch.bfloat16: np.float16,
     torch.float16: np.float16,
+    torch.float8_e4m3fn: np.uint8,
 }
 
 class FunctionalSimulator():

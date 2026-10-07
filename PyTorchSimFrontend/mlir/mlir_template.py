@@ -609,7 +609,13 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                         target_buf = f"{template_buf}_buffer" # FIXME. How to pass spad buffer name?
 
                         # To skip the dma code gen
-                        kernel.buffer_names[prologue_input_arg] = target_buf
+                        original_input = V.graph.graph_inputs.get(prologue_input_arg)
+                        input_buf = target_buf
+                        # FP8 weights: read from the FP8 SRAM buffer and write the FP32 result to the GEMM buffer.
+                        if original_input is not None and original_input.get_dtype() == kernel.prologue_info.get("weight_dtype_override"):
+                            input_buf = kernel.prologue_info["weight_sram_var"]
+
+                        kernel.buffer_names[prologue_input_arg] = input_buf
                         kernel.buffer_names[prologue_output_arg] = target_buf
 
                         # Edge delete

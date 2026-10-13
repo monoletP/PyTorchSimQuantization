@@ -30,6 +30,10 @@ def test_fp8_weight_only_matmul(device, input_size=128, hidden_size=128, output_
 def main():
     device = torch.device("npu:0")
     test_fp8_weight_only_matmul(device, 32, 32, 32)
+    test_fp8_weight_only_matmul(device, 128, 128, 128)
+    test_fp8_weight_only_matmul(device, 256, 256, 256)
+    test_fp8_weight_only_matmul(device, 128, 256, 256)
+    test_fp8_weight_only_matmul(device, 128, 63, 56)
 
 
 if __name__ == "__main__":

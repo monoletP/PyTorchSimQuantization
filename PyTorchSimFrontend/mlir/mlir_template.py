@@ -904,16 +904,21 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
             code = IndentedBuffer()
             prologue_code = self.codegen_prologue_body()
             if prologue_code.getvalue():
-                input_dma_code = self.def_dma_op("MVIN", self.prologue_info["input_dram_var"], self.prologue_info["input_idx"],
-                                self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
-                weight_dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
-                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
-                                dtype_override=self.prologue_info.get("weight_dtype_override"))
                 if (self.prologue_info["is_input_fused"]):
+                    input_dma_code = self.def_dma_op("MVIN", self.prologue_info["input_dram_var"], self.prologue_info["input_idx"],
+                                    self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
+                    weight_dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
+                                    self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
+                                    dtype_override=self.prologue_info.get("weight_dtype_override"))
                     code.splice(input_dma_code)
                     code.splice(prologue_code)
                     code.splice(weight_dma_code)
                 else:
+                    weight_dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
+                                    self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
+                                    dtype_override=self.prologue_info.get("weight_dtype_override"))
+                    input_dma_code = self.def_dma_op("MVIN", self.prologue_info["input_dram_var"], self.prologue_info["input_idx"],
+                                    self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
                     code.splice(weight_dma_code)
                     code.splice(prologue_code)
                     code.splice(input_dma_code)

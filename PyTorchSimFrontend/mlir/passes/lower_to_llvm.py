@@ -60,7 +60,7 @@ def run_standard_lowering(in_path, out_path=None, timing=False):
         # Imperative Python pass: togsim.transfer -> Gemmini asm directly (no
         # memref.dma_start intermediate), then the registered standard lowering.
         lower_transfer_to_gemmini.run(module, timing=timing)
-        # Convert FP8 to FP16 inline assembly, then extend FP16 to FP32.
+        # Convert FP8 through FP16 inline assembly; extend to FP32 if requested.
         lower_fp8_to_inline_asm.run(
             module, vlen=extension_config.vpu_vector_length_bits)
         PassManager.parse(STANDARD_PIPELINE, ctx).run(module.operation)

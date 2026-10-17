@@ -1,4 +1,4 @@
-"""Lower vector<64xf8E4M3FN> to FP32 via FP16 inline assembly."""
+"""Lower fixed E4M3FN vectors to FP16 or FP32 through inline assembly."""
 
 from ._mlir_util import walk_ops
 
@@ -15,7 +15,18 @@ def _fp8_lanes_and_lmul(n, vlen):
     # VLMAX = k * vscale = k * (VLEN / 64) = n
     vscale = vlen // 64     # LLVM scalable-vector multiplier
     k = n // vscale
-    return k, f"m{k // 8}"
+
+    if n % vscale != 0:
+        raise ValueError("n must be divisible by vscale")
+    if k not in (1, 2, 4, 8, 16, 32, 64):
+        raise ValueError(f"Unsupported scalable-vector element count: {k}")
+
+    lmul = k / 8.0
+    if(lmul < 1.0):
+        lmul = f"f{int(1 / lmul)}"
+    else:
+        lmul = f"{int(lmul)}"
+    return k, f"m{lmul}"
 
 
 def _fp8_convert(ip, val, n, vlen):
@@ -33,7 +44,7 @@ def _fp8_convert(ip, val, n, vlen):
         big = vector.ScalableInsertOp(val, llvm.UndefOp(src_ty).result, 0).result
 
         got = llvm.InlineAsmOp(
-            dst_ty, [big], _FP8_ASM.format(n=n, lmul=lmul), _FP8_CONSTRAINTS,
+            dst_ty, [big], _FP8_ASM.format(lmul=lmul), _FP8_CONSTRAINTS,
             has_side_effects=True, asm_dialect=0,).res
 
         small = VectorType.get([n], f16)
@@ -41,7 +52,7 @@ def _fp8_convert(ip, val, n, vlen):
 
 
 def _convert(ip, source, result_type, vlen):
-    """Build the fixed-vector FP8 -> FP16 -> FP32 conversion."""
+    """Convert a fixed FP8 vector to FP16, extending to FP32 when requested."""
     from mlir.ir import Operation, IntegerType, VectorType
 
     shape = VectorType(source.type).shape
@@ -56,6 +67,10 @@ def _convert(ip, source, result_type, vlen):
 
     half = _fp8_convert(ip, raw, n, vlen)
 
+    # If the result type is FP16, we can return early.
+    if half.type == result_type:
+        return half
+
     with ip:
         # Extend FP16 -> FP32.
         return Operation.create(
@@ -64,8 +79,9 @@ def _convert(ip, source, result_type, vlen):
 
 
 def run(module, vlen=256, **_):
-    """Replace only vector<64xf8E4M3FN> -> vector<64xf32> extf operations."""
+    """Replace fixed-vector E4M3FN extensions to FP16 or FP32."""
     from mlir.ir import InsertionPoint
+    import re
 
     targets = []
     for region in module.operation.regions:
@@ -76,9 +92,12 @@ def run(module, vlen=256, **_):
 
                 source_type = str(op.operation.operands[0].type)
                 result_type = str(op.operation.results[0].type)
-                if (source_type == "vector<64xf8E4M3FN>"
-                    and result_type == "vector<64xf32>"):
-                    targets.append(op.operation)
+                match = re.fullmatch(r"vector<(\d+)xf8E4M3FN>", source_type)
+
+                if match:
+                    n = int(match.group(1))
+                    if result_type in (f"vector<{n}xf16>", f"vector<{n}xf32>"):
+                        targets.append(op.operation)
 
     for op in targets:
         converted = _convert(InsertionPoint(op), op.operands[0],

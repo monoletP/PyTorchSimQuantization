@@ -23,12 +23,9 @@ GEMM_TEMPLATE = r"""
 // SUB_TILE_N = {{ SUB_TILE_N }}
 {{kernel.def_global_vars()}}
 
-func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, W, Bias], outputs=[Y], names_str="X, W, Bias, Y", input_reorder=input_reorder)}} {
+func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, WEIGHT_INPUT, Bias], outputs=[Y], names_str="X, W, Bias, Y", input_reorder=input_reorder)}} {
   {{ kernel.def_sram_buffer("X", X_tile_desc, indent_size=2) }}
   {{ kernel.def_sram_buffer("W", W_tile_desc, indent_size=2) }}
-  {% if FP8_WEIGHT_PROLOGUE %}
-  {{ kernel.def_sram_buffer("W_fp8", W_fp8_tile_desc, indent_size=2, dtype_override=FP8_DTYPE) }}
-  {% endif %}
   {{ kernel.def_sram_buffer("Y", Y_tile_desc, indent_size=2) }}
   {% if not Bias %}
   %v0 = arith.constant dense<0.0> : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}x{{DATA_STYPE}}>{% endif %}
@@ -48,8 +45,22 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, W, Bias], outputs=[Y]
         {{ kernel.def_dma_op("MVIN", "X", X_idx, X_tile_desc, subtile_size=[SUB_TILE_M, SUB_TILE_K], indent_size=8) }}
         {{ kernel.def_dma_op("MVIN", "W", W_idx, W_tile_desc, subtile_size=[SUB_TILE_K, SUB_TILE_N], indent_size=8) }}
         {%- endif %}
-        linalg.matmul ins(%X_buffer, %W_buffer : {{ X_tile_desc.get_mlir_shape(DATA_STYPE) }}, {{ W_tile_desc.get_mlir_shape(DATA_STYPE) }})
-                outs(%Y_buffer : {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }})
+        {% if kernel.weight_prologue_node is not none %}
+        "torchsim.matmul"(%X_buffer, %W_buffer, %Y_buffer) ({
+          {{ kernel.codegen_weight_prologue(
+              kernel.weight_prologue_node, WEIGHT_INPUT, WEIGHT_VEC_SIZE
+          ) }}
+        }) : (
+          {{ X_tile_desc.get_mlir_shape(DATA_STYPE) }},
+          {{ W_tile_desc.get_mlir_shape(WEIGHT_STYPE) }},
+          {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }}
+        ) -> ()
+        {% else %}
+        linalg.matmul ins(%X_buffer, %W_buffer :
+            {{ X_tile_desc.get_mlir_shape(DATA_STYPE) }},
+            {{ W_tile_desc.get_mlir_shape(DATA_STYPE) }})
+          outs(%Y_buffer : {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }})
+        {% endif %}
       } { accumulation_loop=true, subtile_loop="k" }
       {{kernel.store_output(indent_size=6)}}
     } { outer_loop=true, subtile_loop="n"  }
@@ -95,7 +106,7 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, W, Bias], outputs=[Y]
       affine.for %index2 = 0 to {{ K }} step {{ TILE_K }} {
         {{ kernel.def_dma_op("MVIN", "X", X_idx, X_tile_desc, subtile_size=[SUB_TILE_M, SUB_TILE_K], indent_size=8) }}
         {{ kernel.def_dma_op("MVIN", "W", W_idx, W_tile_desc, subtile_size=[SUB_TILE_K, SUB_TILE_N], indent_size=8) }}
-        linalg.matmul ins(%X_buffer, %W_buffer : {{ X_tile_desc.get_mlir_shape(DATA_STYPE) }}, {{ W_tile_desc.get_mlir_shape(DATA_STYPE) }})
+        linalg.matmul ins(%X_buffer, %W_buffer : {{ X_tile_desc.get_mlir_shape(DATA_STYPE) }}, {{ W_tile_desc.get_mlir_shape(WEIGHT_STYPE) }})
                 outs(%Y_bufferT : memref<{{TILE_M}}x{{TILE_N}}x{{DATA_STYPE}}, 1>)
       } { accumulation_loop=true, subtile_loop="k" }
       {{kernel.store_output(indent_size=6)}}
@@ -122,10 +133,13 @@ class MLIRGemmTemplate(MLIRTemplate):
                prologue_nodes: Optional[List[IRNode]] = None,
                tile_info = None,
                **kwargs):
-        X, W, Y, M, N, K, n_epilogue_node, n_prologue_node, n_extra_read = self.extract_info(template_buffer_node, epilogue_nodes, prologue_nodes)
+
+        X, W, Y, M, N, K, n_epilogue_node, n_prologue_node, n_extra_read, weight_input, weight_node = self.extract_info(template_buffer_node, epilogue_nodes, prologue_nodes)
         precision_bytes = mlir_common.get_dtype_nbytes(X.get_dtype())
         if tile_info is None:
-            TILE_M, TILE_N, TILE_K, SUB_TILE_M, SUB_TILE_N, SUB_TILE_K = self.select_tile(kernel, M, N, K, n_epilogue_node, n_extra_read, n_prologue_node, precision_bytes)[0]
+            TILE_M, TILE_N, TILE_K, SUB_TILE_M, SUB_TILE_N, SUB_TILE_K = self.select_tile(kernel, M, N, K, n_epilogue_node, n_extra_read, n_prologue_node, precision_bytes,
+                                                                                          weight_precision_bytes=mlir_common.get_dtype_nbytes(weight_input.get_dtype()),
+                                                                                          inline_weight_prologue=weight_node is not None,)[0]
         else:
             TILE_M, TILE_N, TILE_K, SUB_TILE_M, SUB_TILE_N, SUB_TILE_K = tile_info
 
@@ -146,6 +160,17 @@ class MLIRGemmTemplate(MLIRTemplate):
         TOG_latency = M if SUB_TILE_M > M else SUB_TILE_M
         kernel.loop_size =[TOG_latency, SUB_TILE_N, SUB_TILE_K]
 
+        kernel.weight_prologue_node = weight_node
+        storage_dtype = weight_input.get_dtype()
+
+        if kernel.weight_prologue_node is not None:
+            if len(prologue_nodes) != 1:
+                raise NotImplementedError("Expected one weight prologue")
+            if nr_rdim != 0:
+                raise NotImplementedError(
+                    "FP8 weight prologue with reduction epilogue is unsupported"
+                )
+
         # Prepare tile descriptors
         vlane_stride = 1
         vlane_split_axis = 1
@@ -164,13 +189,8 @@ class MLIRGemmTemplate(MLIRTemplate):
         W_tile_desc.set_tile_size_stride(W_tile_size, W_tile_stride)
         W_tile_desc.set_name("W_buffer")
         
-        # fp8 weight descriptor
-        W_fp8_tile_desc = mlir_common.MLIRMultiDimTile(W_tile_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
-        W_fp8_tile_desc.set_tile_size_stride(W_tile_size, W_tile_stride)
-        W_fp8_tile_desc.set_name("W_fp8_buffer")
-        
-        W_tile_desc.offset = W.get_layout().offset
-        W_stride = W.get_layout().stride if N>1 else [Y.get_layout().stride[0], 0]
+        W_tile_desc.offset = weight_input.get_layout().offset
+        W_stride = weight_input.get_layout().stride if N>1 else [Y.get_layout().stride[0], 0]
         W_idx = [sympy.Symbol("index2") * W_stride[0], sympy.Symbol("index1") * W_stride[1]]
 
         vlane_split_axis = vlane_split_axis if nr_rdim==0 else 0
@@ -201,10 +221,7 @@ class MLIRGemmTemplate(MLIRTemplate):
           Bias_idx = None
 
         data_stype = mlir_common.DTYPE_TO_MLIR[X.get_dtype()]
-        
-        # Is the weight in the prologue nodes fp8?       
-        fp8_weight_prologue = False
-                            
+
         if prologue_nodes:
             prologue_output_name = list(prologue_nodes[0].read_writes.writes)[0].name
             if prologue_output_name == X.get_name():
@@ -221,19 +238,6 @@ class MLIRGemmTemplate(MLIRTemplate):
                 prologue_tile_desc = W_tile_desc
                 prologue_dim_aliasing = {"index0":"index2", "index1":"index1"}
                 is_input_fused = False
-            
-            # Is the weight in the prologue nodes fp8? 
-            if not is_input_fused:
-                for node in prologue_nodes:
-                    for read in node.read_writes.reads:
-                        original_input = V.graph.graph_inputs.get(read.name)
-                        if original_input is not None and original_input.get_dtype() == float8_e4m3fn:
-                            fp8_weight_prologue = True 
-            
-            # weight loading info branching for fp8 weight prologue
-            weight_load_desc = W_fp8_tile_desc if fp8_weight_prologue else W_tile_desc
-            weight_load_buffer = "W_fp8_buffer" if fp8_weight_prologue else "W_buffer"
-            weight_load_dtype = float8_e4m3fn if fp8_weight_prologue else None
 
             kernel.prologue_info = dict (
                 input_dram_var = "X",
@@ -244,12 +248,11 @@ class MLIRGemmTemplate(MLIRTemplate):
                 input_dim_aliasing = {"index0":"index0", "index1":"index2"},
 
                 weight_dram_var = "W",
-                weight_sram_var = weight_load_buffer,
-                weight_tile_desc = weight_load_desc,
+                weight_sram_var = "W_buffer",
+                weight_tile_desc = W_tile_desc,
                 weight_idx = W_idx,
                 weight_subtile_size = [TILE_K, TILE_N],
                 weight_dim_aliasing = {"index0": "index2", "index1": "index1"},
-                weight_dtype_override = weight_load_dtype,
 
                 # Descriptor for fusion
                 dram_var = prologue_var,
@@ -288,14 +291,16 @@ class MLIRGemmTemplate(MLIRTemplate):
             Bias_idx = Bias_idx,
             X_tile_desc = X_tile_desc,
             W_tile_desc = W_tile_desc,
-            W_fp8_tile_desc=W_fp8_tile_desc,
-            FP8_DTYPE=float8_e4m3fn,
             Y_tile_desc = Y_tile_desc,
             Bias_tile_desc = Bias_tile_desc,
             epilogue_nodes = epilogue_nodes,
             prologue_nodes = prologue_nodes,
             input_reorder = self.input_reorder,
-            FP8_WEIGHT_PROLOGUE = fp8_weight_prologue
+            WEIGHT_INPUT=weight_input,
+            WEIGHT_STYPE=mlir_common.DTYPE_TO_MLIR[storage_dtype],
+            WEIGHT_VEC_SIZE=(
+                extension_config.vpu_vector_length_bits // mlir_common.MLIR_TO_BIT[data_stype]
+            ),
         )
         
         code = self._template_from_string(template).render(**kernel.render_options)
@@ -308,9 +313,10 @@ class MLIRGemmTemplate(MLIRTemplate):
                epilogue_nodes: Optional[List[IRNode]] = None,
                prologue_nodes: Optional[List[IRNode]] = None,
                **kwargs):
-        X, W, Y, M, N, K, n_epilogue_node, n_prologue_node, n_extra_read = self.extract_info(template_buffer_node, epilogue_nodes, prologue_nodes)
+        X, W, Y, M, N, K, n_epilogue_node, n_prologue_node, n_extra_read, weight_input, weight_node = self.extract_info(template_buffer_node, epilogue_nodes, prologue_nodes)
         precision_bytes = mlir_common.get_dtype_nbytes(X.get_dtype())
-        return self.select_tile(kernel, M, N, K, n_epilogue_node, n_extra_read, n_prologue_node, precision_bytes)
+        return self.select_tile(kernel, M, N, K, n_epilogue_node, n_extra_read, n_prologue_node, precision_bytes,
+                                weight_precision_bytes=mlir_common.get_dtype_nbytes(weight_input.get_dtype()), inline_weight_prologue=weight_node is not None,)
 
     def extract_info(self, template_buffer_node, epilogue_nodes, prologue_nodes):
         if template_buffer_node is not None:
@@ -339,11 +345,25 @@ class MLIRGemmTemplate(MLIRTemplate):
             if self.output_node.name in n_extra_read:
                 n_extra_read.remove(self.output_node.name)
 
+        weight_input = W
+        weight_node = None
+
+        if prologue_nodes:
+            output_name = next(iter(prologue_nodes[0].read_writes.writes)).name
+
+            if output_name == W.get_name():
+                for node in prologue_nodes:
+                    for read in node.read_writes.reads:
+                        candidate = V.graph.graph_inputs.get(read.name)
+                        if candidate is not None and candidate.get_dtype() == float8_e4m3fn:
+                            weight_input = candidate
+                            weight_node = node
+
         # Select tile size
         M, N, K = X_tensor.size()[0], W_tensor.size()[1], X_tensor.size()[1]
-        return X,W,Y,M,N,K,n_epilogue_node,n_prologue_node,len(n_extra_read)
+        return X,W,Y,M,N,K,n_epilogue_node,n_prologue_node,len(n_extra_read), weight_input, weight_node
 
-    def select_tile(self, kernel, M, N, K, n_extra_node, n_extra_read, n_prologue_node, precision_bytes):
+    def select_tile(self, kernel, M, N, K, n_extra_node, n_extra_read, n_prologue_node, precision_bytes, weight_precision_bytes=None, inline_weight_prologue=False,):
         data = {}
         gemm_shape = f"{M}_{N}_{K}"
         if "external" in extension_config.codegen_mapping_strategy:
@@ -362,8 +382,15 @@ class MLIRGemmTemplate(MLIRTemplate):
                 return full_tile_candidates
         else:
             # case 2: use heuristic mapping
-            min_tile = (n_extra_node + n_prologue_node) == 0
-            tile_candidates = kernel.gemm_combination_mapping(M, N, K, n_extra_node + n_extra_read, n_prologue_node, min_tile=True, precision_bytes=precision_bytes)
+            tile_candidates = kernel.gemm_combination_mapping(
+                M, N, K,
+                n_extra_node + n_extra_read,
+                n_prologue_node,
+                min_tile=True,
+                precision_bytes=precision_bytes,
+                weight_precision_bytes=weight_precision_bytes,
+                inline_weight_prologue=inline_weight_prologue,
+            )
 
         # Edge case
         if (M == 0) or (N == 0) or (K == 0):

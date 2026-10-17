@@ -197,6 +197,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
         # Dim info
         self.dim_aliasing = {}
         self.reason = reason
+        self.weight_prologue_node = None
 
     def reset(self, reason):
         self.__init__(
@@ -265,7 +266,13 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
 
         return inner_I, inner_J, inner_K
 
-    def gemm_combination_mapping(self, M, N, K, n_extra_node=0, n_prologue_node=0, n_prologue_extra_read=0, pad_k=True, min_tile=False, is_conv=False, precision_bytes=4):
+    def gemm_combination_mapping(self, M, N, K, n_extra_node=0, n_prologue_node=0, n_prologue_extra_read=0, pad_k=True, min_tile=False, is_conv=False, precision_bytes=4,
+                                 weight_precision_bytes=None, inline_weight_prologue=False):
+        if weight_precision_bytes is None:
+            weight_precision_bytes = precision_bytes
+
+        n_sram_prologue = n_prologue_node - int(inline_weight_prologue)
+
         tile_candidates = []
         spad_size_per_lane = self.spad_info["spad_size"]
         spad_size = spad_size_per_lane * self.vector_lane
@@ -293,11 +300,15 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                 tile_M = i * self.vector_lane if M > self.vector_lane else M_padded
                 for j in tile_N_range:
                     tile_N = j * self.vector_lane if N > self.vector_lane else N_padded
-                    used_spad_size = (tile_M * tile_K * (1 + n_prologue_node) + tile_K * tile_N * (1 + n_prologue_extra_read) + tile_M * tile_N * (1 + n_extra_node)) * precision_bytes
+                    used_spad_size = (
+                        tile_M * tile_K * (1 + n_sram_prologue) * precision_bytes
+                        + tile_K * tile_N * (1 + n_prologue_extra_read) * weight_precision_bytes
+                        + tile_M * tile_N * (1 + n_extra_node) * precision_bytes
+                    )
                     weight_size_per_lane = self.get_spad_size_per_lane(tile_K, tile_N) * (1 + n_prologue_extra_read)
-                    input_size_per_lane = self.get_spad_size_per_lane(tile_M * (1 + n_prologue_node), tile_K)
+                    input_size_per_lane = self.get_spad_size_per_lane(tile_M * (1 + n_sram_prologue), tile_K)
                     output_size_per_lane = self.get_spad_size_per_lane(tile_M * (1 + n_extra_node), tile_N)
-                    used_spad_size_per_lane = (weight_size_per_lane + input_size_per_lane + output_size_per_lane) * precision_bytes
+                    used_spad_size_per_lane = (input_size_per_lane + output_size_per_lane) * precision_bytes + weight_size_per_lane * weight_precision_bytes
                     check_spad_size = (used_spad_size < max_spad_size and used_spad_size_per_lane < max_spad_per_lane)
                     if check_spad_size:
                         dir_path = f"{extension_config.CONFIG_TORCHSIM_DIR}/validation/gemm_candidates"
@@ -319,11 +330,15 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                 tile_M = i * self.vector_lane if M > self.vector_lane else M_padded
                 for j in tile_N_range:
                     tile_N = j * self.vector_lane if N > self.vector_lane else N_padded
-                    used_spad_size = (tile_M * tile_K * (1 + n_prologue_node) + tile_K * tile_N * (1 + n_prologue_extra_read) + tile_M * tile_N * (1 + n_extra_node)) * precision_bytes
+                    used_spad_size = (
+                        tile_M * tile_K * (1 + n_sram_prologue) * precision_bytes
+                        + tile_K * tile_N * (1 + n_prologue_extra_read) * weight_precision_bytes
+                        + tile_M * tile_N * (1 + n_extra_node) * precision_bytes
+                    )
                     weight_size_per_lane = self.get_spad_size_per_lane(tile_K, tile_N) * (1 + n_prologue_extra_read)
-                    input_size_per_lane = self.get_spad_size_per_lane(tile_M * (1 + n_prologue_node), tile_K)
+                    input_size_per_lane = self.get_spad_size_per_lane(tile_M * (1 + n_sram_prologue), tile_K)
                     output_size_per_lane = self.get_spad_size_per_lane(tile_M * (1 + n_extra_node), tile_N)
-                    used_spad_size_per_lane = (weight_size_per_lane + input_size_per_lane + output_size_per_lane) * precision_bytes
+                    used_spad_size_per_lane = (input_size_per_lane + output_size_per_lane) * precision_bytes + weight_size_per_lane * weight_precision_bytes
                     n_tile = math.ceil(M / max(tile_M, 128)) * math.ceil(N / max(tile_N, 128))
                     check_spad_size = (used_spad_size < max_spad_size and used_spad_size_per_lane < max_spad_per_lane)
                     if check_spad_size and max_used_spad_size < used_spad_size and maximize_i_j <= tile_M * tile_N and n_tile >= minimum_n_tile and max(tile_N, 128) // max(tile_M, 128) < 10:
@@ -580,7 +595,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
             kernel.reduction = kernel.reduction_epilogue
 
             # Codegen prologue nodes
-            if prologue_nodes:
+            if prologue_nodes and kernel.weight_prologue_node is None:
                 # Flush created varaibles, since template fusion doen't share variable
                 with kernel.prologue_buffer_group.as_local():
                     _, (group, reduction_group) = max(
@@ -609,13 +624,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                         target_buf = f"{template_buf}_buffer" # FIXME. How to pass spad buffer name?
 
                         # To skip the dma code gen
-                        original_input = V.graph.graph_inputs.get(prologue_input_arg)
-                        input_buf = target_buf
-                        # FP8 weights: read from the FP8 SRAM buffer and write the FP32 result to the GEMM buffer.
-                        if original_input is not None and original_input.get_dtype() == kernel.prologue_info.get("weight_dtype_override"):
-                            input_buf = kernel.prologue_info["weight_sram_var"]
-
-                        kernel.buffer_names[prologue_input_arg] = input_buf
+                        kernel.buffer_names[prologue_input_arg] = target_buf
                         kernel.buffer_names[prologue_output_arg] = target_buf
 
                         # Edge delete
@@ -908,15 +917,13 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                     input_dma_code = self.def_dma_op("MVIN", self.prologue_info["input_dram_var"], self.prologue_info["input_idx"],
                                     self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
                     weight_dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
-                                    self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
-                                    dtype_override=self.prologue_info.get("weight_dtype_override"))
+                                    self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False)
                     code.splice(input_dma_code)
                     code.splice(prologue_code)
                     code.splice(weight_dma_code)
                 else:
                     weight_dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
-                                    self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
-                                    dtype_override=self.prologue_info.get("weight_dtype_override"))
+                                    self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False)
                     input_dma_code = self.def_dma_op("MVIN", self.prologue_info["input_dram_var"], self.prologue_info["input_idx"],
                                     self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
                     code.splice(weight_dma_code)
@@ -927,8 +934,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                                 self.prologue_info["input_tile_desc"], subtile_size=self.prologue_info["input_subtile_size"], async_type=False, lazy_mode=False)
                 code.splice(dma_code)
                 dma_code = self.def_dma_op("MVIN", self.prologue_info["weight_dram_var"], self.prologue_info["weight_idx"],
-                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False,
-                                dtype_override=self.prologue_info.get("weight_dtype_override"))
+                                self.prologue_info["weight_tile_desc"], subtile_size=self.prologue_info["weight_subtile_size"], async_type=False, lazy_mode=False)
                 code.splice(dma_code)
             code = textwrap.indent(code.getvalue(), " "*indent_size).strip()
             return code
@@ -995,7 +1001,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
 
     def def_dma_op(self, dma_type, dram_var:str, index_list:list, tile_desc:mlir_common.MLIRMultiDimTile,
                    subtile_size:list=[], async_type=None, indent_size=0, priority: int = 5, lazy_mode: bool = True,
-                   dram_stride:list=None, dram_offset=None, padding: int = 0, dtype_override=None):
+                   dram_stride:list=None, dram_offset=None, padding: int = 0):
         # Todo. Remove legacy behavior (i.e., index_list parsing)
         def generate_dma_code():
             """Internal method to generate DMA code directly."""
@@ -1012,8 +1018,7 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                 else:
                     numel = self.get_arg_info(self.named_nodes[dram_var].get_name()).get_numel()
                 
-                dtype = dtype_override if dtype_override is not None else node_layout.dtype
-                mlir_dtype = mlir_common.DTYPE_TO_MLIR[dtype]
+                mlir_dtype = mlir_common.DTYPE_TO_MLIR[node_layout.dtype]
                 dram_shape = f"memref<{numel}x{mlir_dtype}>"
 
                 if dram_stride is not None:
@@ -1083,17 +1088,14 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
         self.render_hooks[key] = (priority, generate_dma_code)
         return key
 
-    def def_sram_buffer(self, dram_name, tile_desc, id=0, indent_size=0, dtype_override=None):
+    def def_sram_buffer(self, dram_name, tile_desc, id=0, indent_size=0):
         # Prepare code block
         with self:
-            if dtype_override is not None:
-                dtype = dtype_override
-            else:
-                try:
-                    dtype = self.named_nodes[dram_name].get_layout().dtype
-                except (KeyError, AttributeError, TypeError):
-                    import torch
-                    dtype = torch.float32
+            try:
+                dtype = self.named_nodes[dram_name].get_layout().dtype
+            except (KeyError, AttributeError, TypeError):
+                import torch
+                dtype = torch.float32
             
             tile_shape = tile_desc.get_mlir_shape(mlir_common.DTYPE_TO_MLIR[dtype])
             buffer_name = self.allocate_sram_buffer(dtype, dram_name, tile_desc, id, forced_name=dram_name)
@@ -1403,6 +1405,37 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
                 self.compute_body_loop.size = tile_desc.get_numel_per_lane()
                 self.compute_body_loop.step = tile_desc.get_compute_vec_size()
         return tile_desc
+
+    def codegen_weight_prologue(self, node, source, n):
+        data = node.node.data
+        if list(data.ranges) != list(source.get_size()):
+            raise NotImplementedError("Weight shape transformation is unsupported")
+
+        dtype = mlir_common.DTYPE_TO_MLIR[source.get_dtype()]
+        indices = list(sympy.symbols(f"i0:{len(data.ranges)}", integer=True))
+        expected = source.get_layout().make_indexer()(indices)
+
+        group = IndentedBufferGroup(self, prefix="weight_")
+        arg = self.register_var_cse("weight_arg", n, dtype)
+
+        def load(name, index):
+            if name != source.get_name() or sympy.simplify(index - expected) != 0:
+                raise NotImplementedError("Expected a direct weight load")
+            return arg
+
+        with self, group.as_local(), patch.object(self, "load", load):
+            result = data.inner_fn(indices).value
+
+        size, result_dtype = self.var_info[result]
+        if size != n:
+            raise NotImplementedError("Expected a weight vector result")
+
+        return (
+            f"^bb0(%weight_arg: vector<{n}x{dtype}>):\n"
+            + group.compute.getvalue()
+            + f'"torchsim.yield"(%{result})'
+            + f" : (vector<{n}x{result_dtype}>) -> ()"
+        )
 
 class MLIRTemplateBuffer(CUDATemplateBuffer):
     """Template output buffer that can own extra MutationOutputs beyond its primary output.

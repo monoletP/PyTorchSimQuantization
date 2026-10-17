@@ -32,7 +32,7 @@ import mlir.ir as ir  # noqa: E402
 from ._mlir_util import walk_ops, i32, i64, attr_bool
 
 MARKERS = ("linalg.matmul", "math.exp", "math.erf", "math.tanh", "math.sin",
-           "math.cos", "math.log", "math.atan")
+           "math.cos", "math.log", "math.atan", "torchsim.matmul")
 
 # math op name -> (opcode, imm) for the vcix.v.iv lowering (mirror Math*ToVCIX). The
 # sf.vc.v.iv opcode field is 2 bits: erf(0)/tanh(1)/sin,cos,log,atan(2)/exp(3), and
@@ -326,9 +326,29 @@ class _DmaView:
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
+def _inline_weight_prologue(op, raw):
+    clone = op.clone(ip=ir.InsertionPoint.current)
+    block = clone.regions[0].blocks[0]
+
+    if len(block.arguments) != 1 or block.arguments[0].type != raw.type:
+        raise ValueError("Weight prologue input type mismatch")
+
+    block.arguments[0].replace_all_uses_with(raw)
+    operations = list(block.operations)
+    terminator = operations[-1]
+
+    if terminator.name != "torchsim.yield" or len(terminator.operands) != 1:
+        raise ValueError("Expected one weight prologue result")
+
+    result = terminator.operands[0]
+    for child in operations[:-1]:
+        child.operation.move_before(clone)
+
+    clone.erase()
+    return result
 
 def _lower_matmul(op, SS, vlen):
-    """Lower one linalg.matmul (gemm path) to the vcix push/compute/pop sequence.
+    """Lower linalg.matmul or torchsim.matmul to VCIX push/compute/pop.
     Returns True if lowered, False if skipped (conv2d / unexpected nesting -> left
     for the C++ pass / a later port). Mirrors MatmulOpLowering (gemm branch)."""
     from mlir.dialects import arith
@@ -337,6 +357,7 @@ def _lower_matmul(op, SS, vlen):
     mtA, mtB = ir.MemRefType(A.type), ir.MemRefType(B.type)
     elt = mtA.element_type
     M, K, N = mtA.shape[0], mtA.shape[1], mtB.shape[1]
+    has_prologue = op.name == "torchsim.matmul"
     # Mirror the C++ guard: a dimension > SS must be an exact multiple, else the
     # N//SS / K//SS loop trip counts below silently drop the tail tile.
     for _dim, _name in ((M, "M"), (N, "N"), (K, "K")):
@@ -504,13 +525,28 @@ def _lower_matmul(op, SS, vlen):
         if BAsync:
             _dma_wait(BTag, btag_idx, num1)
 
+        if has_prologue:
+            weight_elt = mtB.element_type
+            weight_vector_type = ir.VectorType.get([nr_element], weight_elt)
+            weight_zero = arith.ConstantOp(
+                weight_elt, ir.FloatAttr.get(weight_elt, 0.0)
+            ).result
+
         # --- weight push loop (K x N) ---
         for i in range(0, SS, nr_element):
             if i < K:
                 sp = _apply(spad_map, [n_idx, k_idx, _const_index(i), K_val, _const_index(SS)])
                 wx = _apply(spadX, [sp, N_val])
                 wy = _apply(spadY, [sp, N_val])
-                wv = _transfer_read(vectorType, B, [wx, wy], zero_pad)
+                if has_prologue:
+                    raw = _transfer_read(
+                        weight_vector_type, B, [wx, wy], weight_zero
+                    )
+                    wv = _inline_weight_prologue(op, raw)
+                    if wv.type != vectorType:
+                        raise ValueError("Weight prologue result type mismatch")
+                else:
+                    wv = _transfer_read(vectorType, B, [wx, wy], zero_pad)
             else:
                 wv = zero_vector
             _vcix("vcix.iv", [wv, rvl], [],
@@ -605,6 +641,7 @@ def _lower_matmul(op, SS, vlen):
             else:
                 out = arith.AddFOp(prev, vpop).result
             _transfer_write(out, C, [x, y])
+
     op.erase()
     return True
 
@@ -616,10 +653,12 @@ def run(module, vectorlane=128, vlen=128, **_):
     for region in module.operation.regions:
         for b in region.blocks:
             for o in walk_ops(b):
-                if o.operation.name == "linalg.matmul":
+                if o.operation.name in ("linalg.matmul", "torchsim.matmul"):
                     mms.append(o.operation)
     for o in mms:
-        _lower_matmul(o, vectorlane, vlen)
+        is_custom = o.name == "torchsim.matmul"
+        if not _lower_matmul(o, vectorlane, vlen) and is_custom:
+            raise NotImplementedError("Unsupported torchsim.matmul layout")
     targets = []
     for region in module.operation.regions:
         for b in region.blocks:

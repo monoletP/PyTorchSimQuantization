@@ -359,7 +359,7 @@ def _run_func(func, vectorlane):
     dmas = []
     for op in walk_ops(func.regions[0].blocks[0]):
         name = op.operation.name
-        if name == "linalg.matmul" and matmul is None:
+        if name in ("linalg.matmul", "torchsim.matmul") and matmul is None:
             matmul = op
         elif name == "togsim.transfer":
             dmas.append(op)
